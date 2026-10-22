@@ -3143,15 +3143,93 @@ function nameIsInPrompt(rawName, lowerPrompt) {
     });
 }
 
-function matchNpcReferences(prompt, npcList) {
-    if (!prompt || !npcList || npcList.length === 0) return [];
-    const lowerPrompt = prompt.toLowerCase();
-    const matched = [];
-    for (const npc of npcList) {
-        if (!npc || !npc.name || (!npc.imagePath && !npc.imageBase64 && !npc.imageData)) continue;
-        if (nameIsInPrompt(npc.name, lowerPrompt)) {
-            matched.push({ name: npc.name, imageBase64: npc.imageBase64, imagePath: npc.imagePath });
+// SLAY_KOLD_AUTOREFS_2026 — automatically select named characters from Saved library.
+function slayKoldNorm(text) {
+    return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('ru').replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+function slayKoldForms(word) {
+    const w = slayKoldNorm(word);
+    const forms = new Set([w]);
+    if (!/^[а-я]+$/.test(w) || w.length < 3) return [...forms];
+    if (w.endsWith('а')) {
+        for (const e of ['ы','и','е','у','ой','ою']) forms.add(w.slice(0, -1) + e);
+    } else if (w.endsWith('я')) {
+        for (const e of ['и','е','ю','ей','ею']) forms.add(w.slice(0, -1) + e);
+    } else if (w.endsWith('ь') || w.endsWith('й')) {
+        for (const e of ['я','ю','ем','е','и','ём']) forms.add(w.slice(0, -1) + e);
+    } else {
+        for (const e of ['а','у','е','ом','ем','ым','им','ой']) forms.add(w + e);
+    }
+    return [...forms];
+}
+function slayKoldPos(word, prompt) {
+    for (const form of slayKoldForms(word)) {
+        if (!form || form.length < 3) continue;
+        if (wordBoundaryIncludes(form, prompt)) return prompt.indexOf(form);
+    }
+    return -1;
+}
+function slayKoldHit(names, prompt) {
+    let best = null;
+    for (const alias of String(names || '').split(/[,;|]+/)) {
+        const a = slayKoldNorm(alias);
+        if (!a) continue;
+        const parts = a.split(/\s+/).filter(Boolean);
+        let score = 0, pos = -1, key = '';
+        if (a.length >= 3 && wordBoundaryIncludes(a, prompt)) {
+            score = parts.length > 1 ? 3 : 1; pos = prompt.indexOf(a); key = a;
+        } else {
+            const positions = parts.map(p => slayKoldPos(p, prompt));
+            if (parts.length > 1 && positions.every(n => n >= 0)) {
+                score = 2; pos = Math.min(...positions); key = a;
+            } else if (parts.length === 1 && positions[0] >= 0) {
+                score = 1; pos = positions[0]; key = a;
+            }
         }
+        if (score && (!best || score > best.score || (score === best.score && pos < best.pos)))
+            best = {score, pos, key};
+    }
+    return best;
+}
+function matchNpcReferences(prompt, npcList) {
+    if (!prompt) return [];
+    const lower = slayKoldNorm(prompt);
+    const matched = [];
+    const paths = new Set(), manual = [];
+    // Original manual NPC slots retain precedence.
+    for (const npc of (Array.isArray(npcList) ? npcList : [])) {
+        if (!npc || !npc.name || (!npc.imagePath && !npc.imageBase64 && !npc.imageData)) continue;
+        if (!nameIsInPrompt(npc.name, String(prompt).toLowerCase())) continue;
+        matched.push({ name: npc.name, imageBase64: npc.imageBase64 || npc.imageData, imagePath: npc.imagePath });
+        manual.push(slayKoldNorm(npc.name));
+        if (npc.imagePath) paths.add(npc.imagePath);
+    }
+    if (getSettings().autoLibraryRefs === false) return matched;
+    const characterRefs = getCurrentCharacterRefs();
+    const reserved = [];
+    if (characterRefs?.charRef?.imagePath) reserved.push(slayKoldNorm(getDefaultCharRefName(characterRefs)));
+    if (characterRefs?.userRef?.imagePath) reserved.push(slayKoldNorm(getDefaultUserRefName(characterRefs)));
+    const candidates = [];
+    for (const person of getSavedChars()) {
+        const look = person.looks?.find(l => l && l.path);
+        if (!look || paths.has(look.path)) continue;
+        const names = String(person.names || '');
+        const hit = slayKoldHit(names, lower);
+        if (!hit) continue;
+        const aliases = names.split(/[,;|]+/).map(slayKoldNorm);
+        if ([...manual, ...reserved].some(m => m && aliases.includes(m))) continue;
+        candidates.push({person,look,hit});
+    }
+    // A surname or first name shared by two people must not silently choose the wrong face.
+    const weak = new Map();
+    for (const c of candidates) if (c.hit.score === 1)
+        weak.set(c.hit.key, (weak.get(c.hit.key) || 0) + 1);
+    candidates.sort((a,b)=> b.hit.score - a.hit.score || a.hit.pos - b.hit.pos);
+    for (const c of candidates) {
+        if (c.hit.score === 1 && weak.get(c.hit.key) > 1) continue;
+        if (paths.has(c.look.path)) continue;
+        matched.push({name:String(c.person.names).split(',')[0].trim(), imagePath:c.look.path, imageBase64:''});
+        paths.add(c.look.path);
     }
     return matched;
 }
@@ -3411,6 +3489,90 @@ function removeRecentRef(path) {
     settings.recentRefs = settings.recentRefs.filter(r => (typeof r === 'string' ? r : r.path) !== path);
     saveSettings();
     try { renderRecentRefsRibbon(); } catch (_) {}
+}
+
+// SLAY_KOLD_BULK_IMPORT_2026 — official multi-angle student sheets.
+const SLAY_KOLD_STUDENTS = [{"ru":"Максим Страхов","aliases":"Максим Страхов, Maxim Strakhov, Максим, Страхов, Maxim, Strakhov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/maksim.webp","file":"maksim.webp"},{"ru":"Глеб Вагин","aliases":"Глеб Вагин, Gleb Vagin, Глеб, Вагин, Gleb, Vagin","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/gleb.webp","file":"gleb.webp"},{"ru":"Дана Островская","aliases":"Дана Островская, Dana Ostrovskaya, Дана, Островская, Dana, Ostrovskaya","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/dana.webp","file":"dana.webp"},{"ru":"Стася Носкова","aliases":"Стася Носкова, Stasya Noskova, Стася, Носкова, Stasya, Noskova","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/stasya.webp","file":"stasya.webp"},{"ru":"Вика Рябинина","aliases":"Вика Рябинина, Vika Ryabinina, Вика, Рябинина, Vika, Ryabinina","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/vika.webp","file":"vika.webp"},{"ru":"Гена Кайманов","aliases":"Гена Кайманов, Gena Kaymanov, Гена, Кайманов, Gena, Kaymanov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/gena.webp","file":"gena.webp"},{"ru":"Кеша Туманов","aliases":"Кеша Туманов, Kesha Tumanov, Кеша, Туманов, Kesha, Tumanov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/kesha.webp","file":"kesha.webp"},{"ru":"Илья Живой","aliases":"Илья Живой, Ilya Zhivoy, Илья, Живой, Ilya, Zhivoy","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/ilya.webp","file":"ilya.webp"},{"ru":"Паша Хмуров","aliases":"Паша Хмуров, Pasha Khmurov, Паша, Хмуров, Pasha, Khmurov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/pasha.webp","file":"pasha.webp"},{"ru":"Стёпа Облаков","aliases":"Стёпа Облаков, Styopa Oblakov, Стёпа, Облаков, Styopa, Oblakov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/stepa.webp","file":"stepa.webp"},{"ru":"Алекс Колокольников","aliases":"Алекс Колокольников, Alex Kolokolnikov, Алекс, Колокольников, Alex, Kolokolnikov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/aleks.webp","file":"aleks.webp"},{"ru":"Сева Страхов","aliases":"Сева Страхов, Seva Strakhov, Сева, Страхов, Seva, Strakhov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/seva.webp","file":"seva.webp"},{"ru":"Денис Носков","aliases":"Денис Носков, Denis Noskov, Денис, Носков, Denis, Noskov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/denis.webp","file":"denis.webp"},{"ru":"Антон Погибельский","aliases":"Антон Погибельский, Anton Pogibelsky, Антон, Погибельский, Anton, Pogibelsky","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/anton.webp","file":"anton.webp"},{"ru":"Вениамин Исаев","aliases":"Вениамин Исаев, Veniamin Isaev, Вениамин, Исаев, Veniamin, Isaev","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/veniamin.webp","file":"veniamin.webp"},{"ru":"Валера Лапин","aliases":"Валера Лапин, Valera Lapin, Валера, Лапин, Valera, Lapin","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/valera.webp","file":"valera.webp"},{"ru":"Иван «Жуан» Солнцев","aliases":"Иван Солнцев, Ivan Solntsev, Жуан, Juan, Иван, Солнцев, Ivan, Solntsev","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/zhuan.webp","file":"zhuan.webp"},{"ru":"Артём Тихонов","aliases":"Артём Тихонов, Artyom Tikhonov, Артём, Тихонов, Artyom, Tikhonov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/artyom.webp","file":"artyom.webp"},{"ru":"Роман «Ро» Торн","aliases":"Роман Торн, Roman Thorne, Ро, Ro, Роман, Торн, Roman, Thorne","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/roman.webp","file":"roman.webp"},{"ru":"Нико Феррари","aliases":"Нико Феррари, Nico Ferrari, Нико, Феррари, Nico, Ferrari","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/niko.webp","file":"niko.webp"},{"ru":"Калеб Локхарт","aliases":"Калеб Локхарт, Caleb Lockhart, Калеб, Локхарт, Caleb, Lockhart","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/kaleb.webp","file":"kaleb.webp"},{"ru":"Дэмиен Синклер","aliases":"Дэмиен Синклер, Damien Sinclair, Дэмиен, Синклер, Damien, Sinclair","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/damien.webp","file":"damien.webp"},{"ru":"Хлоя Коллинз","aliases":"Хлоя Коллинз, Chloe Collins, Хлоя, Коллинз, Chloe, Collins","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/khloya.webp","file":"khloya.webp"},{"ru":"Арчер Стюарт","aliases":"Арчер Стюарт, Archer Stewart, Арчер, Стюарт, Archer, Stewart","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/archer.webp","file":"archer.webp"},{"ru":"Энди Галлахер","aliases":"Энди Галлахер, Andy Gallagher, Энди, Галлахер, Andy, Gallagher","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/endi.webp","file":"endi.webp"},{"ru":"Феликс Кюри","aliases":"Феликс Кюри, Félix Curie, Феликс, Кюри, Félix, Curie","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/feliks.webp","file":"feliks.webp"},{"ru":"Вивьен Тейлор","aliases":"Вивьен Тейлор, Vivienne Taylor, Вивьен, Тейлор, Vivienne, Taylor","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/vivien.webp","file":"vivien.webp"},{"ru":"Винсент Тейлор","aliases":"Винсент Тейлор, Vincent Taylor, Винсент, Тейлор, Vincent, Taylor","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/vinsent.webp","file":"vinsent.webp"},{"ru":"Максимилиан «Фонарь» Левин","aliases":"Максимилиан Левин, Maximilian Levin, Фонарь, Fonar, Максимилиан, Левин, Maximilian, Levin","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/fonar.webp","file":"fonar.webp"},{"ru":"Стефания «Стеша» Шевцова","aliases":"Стефания Шевцова, Stefania Shevtsova, Стеша, Stesha, Стефания, Шевцова, Stefania, Shevtsova","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/stesha.webp","file":"stesha.webp"},{"ru":"Трофим «Тротил» Прохоров","aliases":"Трофим Прохоров, Trofim Prokhorov, Тротил, Trotil, Трофим, Прохоров, Trofim, Prokhorov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/trofim.webp","file":"trofim.webp"},{"ru":"Влад «Барс» Барсов","aliases":"Влад Барсов, Vlad Barsov, Барс, Bars, Влад, Барсов, Vlad, Barsov","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/vlad.webp","file":"vlad.webp"},{"ru":"Марат «Мишарин» Сафин","aliases":"Марат Сафин, Marat Safin, Мишарин, Misharin, Марат, Сафин, Marat, Safin","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/marat.webp","file":"marat.webp"},{"ru":"Лев «Перец» Вишнецкий","aliases":"Лев Вишнецкий, Lev Vishnetsky, Перец, Perets, Лев, Вишнецкий, Lev, Vishnetsky","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/lev.webp","file":"lev.webp"},{"ru":"Константин Поддубный","aliases":"Константин Поддубный, Konstantin Poddubny, Константин, Поддубный, Konstantin, Poddubny","url":"https://wewwaistyping.github.io/russkayatoska/koldovstvorets/images/refs/t/kostya.webp","file":"kostya.webp"}];
+function slayKoldImportStatus(s) {
+    const node = document.getElementById('slay_kold_bulk_status');
+    if (node) node.textContent = s;
+}
+function slayKoldExisting(student) {
+    const full = slayKoldNorm(student.ru.replace(/[«“"][^»”"]+[»”"]/g,'').replace(/\s+/g,' '));
+    return getSavedChars().find(c => String(c.names||'').split(',').some(alias=>slayKoldNorm(alias)===full));
+}
+async function slayKoldBlobToB64(blob) {
+    const temp = URL.createObjectURL(blob);
+    try {
+        const image = new Image();
+        image.src = temp;
+        await image.decode();
+        if (!image.naturalWidth || !image.naturalHeight) throw new Error('Пустое изображение');
+        const canvas = document.createElement('canvas');
+        canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+        canvas.getContext('2d').drawImage(image, 0, 0);
+        const value = canvas.toDataURL('image/jpeg', 0.9);
+        canvas.width = canvas.height = 1; image.src = '';
+        if (!value.startsWith('data:image/jpeg;base64,')) throw new Error('Не удалось преобразовать WebP');
+        return value.split(',')[1];
+    } finally { URL.revokeObjectURL(temp); }
+}
+async function slayKoldImportAll(files = null) {
+    const button = document.getElementById('slay_kold_bulk_btn');
+    if (button) button.disabled = true;
+    let added = 0, skipped = 0, errors = [];
+    const byName = new Map((files || []).map(f => [f.name.toLowerCase(), f]));
+    try {
+        for (const [i, student] of SLAY_KOLD_STUDENTS.entries()) {
+            slayKoldImportStatus((i+1) + '/35 — ' + student.ru);
+            let entry = slayKoldExisting(student);
+            if (entry?.looks?.some(look => look.label === 'Колдовстворец — полный реф' && look.path)) {
+                skipped++; continue;
+            }
+            try {
+                let blob;
+                if (files) {
+                    blob = byName.get(student.file.toLowerCase());
+                    if (!blob) throw new Error('Нет файла ' + student.file);
+                } else {
+                    const response = await fetch(student.url, {credentials:'omit',mode:'cors'});
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    blob = await response.blob();
+                }
+                const b64 = await slayKoldBlobToB64(blob);
+                const path = await saveRefImageToFile(b64, 'kold_' + student.file.replace(/\.webp$/,'') , {skipDedupCheck:true});
+                if (!path) throw new Error('SillyTavern не сохранила изображение');
+                entry = slayKoldExisting(student);
+                if (entry) {
+                    const allNames = new Map();
+                    for (const n of (student.aliases + ',' + entry.names).split(',')) {
+                        const key = slayKoldNorm(n);
+                        if (key && !allNames.has(key)) allNames.set(key,n.trim());
+                    }
+                    entry.names = [...allNames.values()].join(', ');
+                    entry.looks.unshift({ id: swUid('sl'),label:'Колдовстворец — полный реф',path,addedAt:Date.now() });
+                    saveSettings();
+                } else {
+                    saveLook({names:student.aliases,label:'Колдовстворец — полный реф',path});
+                }
+                added++;
+            } catch (err) {
+                errors.push(student.ru + ': ' + (err?.message || String(err)));
+                console.warn('[SLAY AutoRefs] import failed',student.ru,err);
+                if (!files && err instanceof TypeError && /fetch|network/i.test(String(err.message))) {
+                    slayKoldImportStatus('CORS: автоматическое скачивание заблокировано. Используй «Из файлов».');
+                    break;
+                }
+            }
+        }
+        try { renderSavedPortraits(); } catch (_) {}
+        const summary = 'Добавлено ' + added + ', пропущено ' + skipped + ', ошибок ' + errors.length;
+        slayKoldImportStatus(summary + (errors.length ? ' — см. консоль браузера.' : ''));
+        if (errors.length) console.warn('[SLAY AutoRefs] Импорт', errors);
+        if (typeof toastr !== 'undefined') {
+            errors.length ? toastr.warning(summary, 'Колдовстворец') : toastr.success(summary, 'Колдовстворец');
+        }
+    } finally { if (button) button.disabled = false; }
 }
 
 // ── Библиотека сохранённых персонажей ──
@@ -6350,6 +6512,16 @@ function createSettingsUI() {
                     <!-- v4.2 Recent refs ribbon — populated on render -->
                     <label class="checkbox_label" style="margin-top:10px;"><input type="checkbox" id="slay_skip_crop" ${settings.skipCrop ? 'checked' : ''}><span>Не предлагать кроп картинок</span></label>
                     <p class="hint" style="margin-top:2px;font-size:0.75em;">Касается рефов, образов и вещей гардероба.</p>
+                    <!-- SLAY_KOLD_AUTOREFS_2026: Automatic library references -->
+                    <label class="checkbox_label" style="display:block;margin:8px 0;">
+                        <input type="checkbox" id="slay_kold_autorefs" ${settings.autoLibraryRefs !== false ? 'checked' : ''}>
+                        <span>AutoRefs: автоматически брать рефы из библиотеки по именам</span>
+                    </label>
+                    <div style="display:flex;gap:7px;flex-wrap:wrap;margin:8px 0">
+                        <button type="button" class="menu_button" id="slay_kold_bulk_btn">📥 Импорт 35 студентов Колдовстворца</button>
+                        <label class="menu_button">Из файлов <input type="file" id="slay_kold_bulk_files" multiple accept=".webp,image/webp" style="display:none"></label>
+                    </div>
+                    <p id="slay_kold_bulk_status" class="hint">Оригинальные подробные рефы. Лимит изображений на одну генерацию остаётся прежним.</p>
                     <div id="slay_recent_refs_ribbon" class="iig-recent-refs-ribbon"></div>
                     <!-- Saved character library — permanent, named, survives chat switches -->
                     <div id="slay_saved_portraits" class="iig-saved-panel iig-hidden"></div>
@@ -6483,6 +6655,19 @@ function createSettingsUI() {
         document.getElementById('slay_saved_portraits')?.classList.remove('iig-hidden');
         document.getElementById('slay_saved_toggle')?.classList.add('iig-saved-toggle-on');
     }
+    // SLAY_KOLD_AUTOREFS_2026 — bind settings and batch import.
+    document.getElementById('slay_kold_autorefs')?.addEventListener('change', e => {
+        settings.autoLibraryRefs = !!e.currentTarget.checked;
+        saveSettings();
+    });
+    document.getElementById('slay_kold_bulk_btn')?.addEventListener('click', async () => {
+        if (confirm('Импортировать 35 подробных референсов с сайта Колдовстворца?')) await slayKoldImportAll();
+    });
+    document.getElementById('slay_kold_bulk_files')?.addEventListener('change', async e => {
+        const files = Array.from(e.currentTarget.files || []);
+        if (files.length) await slayKoldImportAll(files);
+        e.currentTarget.value = '';
+    });
     const savedToggle = document.getElementById('slay_saved_toggle');
     savedToggle?.addEventListener('click', (e) => {
         e.preventDefault(); e.stopPropagation();
